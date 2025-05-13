@@ -1,49 +1,64 @@
 import subprocess
 import re
 import time
-from datetime import datetime
+import threading
+from collections import defaultdict, deque
 
-# Regex to catch IPs from kernel SYN flood logs
-log_pattern = re.compile(r'SYN FLOOD DROPPED.*SRC=([\d.]+)')
+# --- Configuration ---
+ban_threshold = 5           # Number of SYN FLOOD logs before banning
+ban_duration = 3600         # Seconds to ban IP (1 hour)
+log_keyword = "SYN FLOOD DROPPED"
+check_interval = 0.000001        # Seconds between log line checks
 
-# Track banned IPs with timestamps
+# Track IPs and their timestamps
+ip_activity = defaultdict(lambda: deque(maxlen=ban_threshold))
 banned_ips = {}
-BAN_DURATION = 3600  # 1 hour
 
+# Regex to extract IPs from log line
+ip_regex = re.compile(r'SRC=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)')
+
+# Ban IP with iptables
 def ban_ip(ip):
-    if ip not in banned_ips:
-        print(f"[{datetime.now()}] BANNING IP: {ip}")
-        subprocess.run(["sudo", "ipset", "add", "blacklist", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        banned_ips[ip] = time.time()
+    if ip in banned_ips:
+        return
+    print(f"[!] Banning IP: {ip}")
+    subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"])
+    banned_ips[ip] = time.time()
 
-def unban_expired_ips():
-    now = time.time()
-    for ip in list(banned_ips.keys()):
-        if now - banned_ips[ip] > BAN_DURATION:
-            print(f"[{datetime.now()}] UNBANNING IP: {ip}")
-            subprocess.run(["sudo", "ipset", "del", "blacklist", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            del banned_ips[ip]
+    # Schedule unban
+    threading.Thread(target=unban_ip_after_delay, args=(ip,), daemon=True).start()
 
+# Unban IP after delay
+def unban_ip_after_delay(ip):
+    time.sleep(ban_duration)
+    print(f"[+] Unbanning IP: {ip}")
+    subprocess.run(["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"])
+    banned_ips.pop(ip, None)
+
+# Monitor logs
 def monitor_logs():
-    print(">> DoS Defender Mk1 is scanning kernel logs (journalctl -kf)...")
-    process = subprocess.Popen(['journalctl', '-kf'], stdout=subprocess.PIPE, text=True)
+    journal = subprocess.Popen(["journalctl", "-kf"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
-    while True:
-        line = process.stdout.readline()
-        if not line:
-            break
+    for line in iter(journal.stdout.readline, ''):
+        if log_keyword not in line:
+            continue
+        match = ip_regex.search(line)
+        if not match:
+            continue
 
-        match = log_pattern.search(line)
-        if match:
-            ip = match.group(1)
-            ban_ip(ip)
+        ip = match.group(1)
+        now = time.time()
+        ip_activity[ip].append(now)
 
-        unban_expired_ips()
-        time.sleep(0.5)
+        # If enough hits in short time, ban IP
+        if len(ip_activity[ip]) == ban_threshold:
+            time_span = ip_activity[ip][-1] - ip_activity[ip][0]
+            if time_span <= 60:  # 60 seconds window
+                ban_ip(ip)
+                ip_activity[ip].clear()
 
-if __name__ == "__main__":
-    try:
-        monitor_logs()
-    except KeyboardInterrupt:
-        print(">> Stopping DoS Defender Mk1")
-
+try:
+    print("[*] DoS Defender Mk1 is active. Watching logs...")
+    monitor_logs()
+except KeyboardInterrupt:
+    print("\n[!] Stopping DoS Defender Mk1. Goodbye.")
